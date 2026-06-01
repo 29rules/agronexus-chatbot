@@ -1,27 +1,53 @@
 import os
+from openai import OpenAI
 from dotenv import load_dotenv
 from langchain_community.document_loaders import DirectoryLoader, TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_openai import ChatOpenAI
 from langchain_community.vectorstores import FAISS
+from langchain_openai import ChatOpenAI
 from langchain.chains import ConversationalRetrievalChain
 from langchain.memory import ConversationBufferMemory
+from langchain_core.embeddings import Embeddings
+from typing import List
 
 load_dotenv()
 
 FAISS_PATH = "faiss_index"
-API_KEY = os.environ.get("OPENAI_API_KEY")
-API_BASE = os.environ.get("OPENAI_API_BASE", "https://openrouter.ai/api/v1")
+CHAT_KEY  = os.environ.get("OPENAI_API_KEY")
+CHAT_BASE = os.environ.get("OPENAI_API_BASE", "https://openrouter.ai/api/v1")
+EMBED_KEY = os.environ.get("OPENAI_EMBEDDING_KEY")
 
-print(f"🔑 Key: {API_KEY[:15] if API_KEY else 'NOT FOUND'}")
-print(f"🌐 Base: {API_BASE}")
+print(f"🔑 Chat key:  {CHAT_KEY[:15] if CHAT_KEY else 'NOT FOUND'}")
+print(f"🔑 Embed key: {EMBED_KEY[:15] if EMBED_KEY else 'NOT FOUND'}")
+print(f"🌐 Chat base: {CHAT_BASE}")
 
-# Free local embeddings — no API needed, runs on your machine
+
+class DirectOpenAIEmbeddings(Embeddings):
+    """
+    Calls OpenAI embeddings API directly using the openai client.
+    Bypasses LangChain's OpenAIEmbeddings which ignores api_key parameter.
+    """
+    def __init__(self, api_key: str, model: str = "text-embedding-3-small"):
+        self.client = OpenAI(api_key=api_key)
+        self.model = model
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        response = self.client.embeddings.create(
+            input=texts,
+            model=self.model
+        )
+        return [item.embedding for item in response.data]
+
+    def embed_query(self, text: str) -> List[float]:
+        response = self.client.embeddings.create(
+            input=[text],
+            model=self.model
+        )
+        return response.data[0].embedding
+
+
 def get_embeddings():
-    return HuggingFaceEmbeddings(
-        model_name="all-MiniLM-L6-v2"
-    )
+    return DirectOpenAIEmbeddings(api_key=EMBED_KEY)
 
 
 def build_knowledge_base():
@@ -34,48 +60,41 @@ def build_knowledge_base():
     chunks = splitter.split_documents(documents)
     print(f"   Split into {len(chunks)} chunks")
 
-    print("🔢 Creating embeddings (free, local model)...")
-    embeddings = get_embeddings()
-    vector_store = FAISS.from_documents(chunks, embeddings)
+    print("🔢 Creating embeddings via OpenAI...")
+    vector_store = FAISS.from_documents(chunks, get_embeddings())
     vector_store.save_local(FAISS_PATH)
     print("✅ Knowledge base saved!")
     return vector_store
 
 
 def load_knowledge_base():
-    embeddings = get_embeddings()
-    vector_store = FAISS.load_local(
+    return FAISS.load_local(
         FAISS_PATH,
-        embeddings,
+        get_embeddings(),
         allow_dangerous_deserialization=True
     )
-    return vector_store
 
 
 def create_chain(vector_store):
-    # OpenRouter handles the chat/LLM part just fine
     llm = ChatOpenAI(
         model_name="openai/gpt-4o-mini",
         temperature=0.3,
-        openai_api_key=API_KEY,
-        openai_api_base=API_BASE,
+        openai_api_key=CHAT_KEY,
+        openai_api_base=CHAT_BASE,
         default_headers={
             "HTTP-Referer": "https://agronexustrading.in",
             "X-Title": "Agronexus Chatbot"
         }
     )
-
     memory = ConversationBufferMemory(
         memory_key="chat_history",
         return_messages=True,
         output_key="answer"
     )
-
     retriever = vector_store.as_retriever(
         search_type="similarity",
         search_kwargs={"k": 3}
     )
-
     chain = ConversationalRetrievalChain.from_llm(
         llm=llm,
         retriever=retriever,
@@ -88,9 +107,11 @@ def create_chain(vector_store):
 
 SYSTEM_PROMPT = """You are AgroBot, the friendly customer assistant for
 Agronexus Trading Co., a premium Indian spice and mango export company
-based in Toronto, Canada. Answer questions about products, pricing,
-shipping, and orders. If unsure, direct to info@agronexustrading.in.
-Keep answers concise and professional."""
+based in Toronto, Canada with sourcing operations in Gujarat.
+Answer questions about products, pricing, shipping, and policies.
+Be warm, professional, and concise (2-4 sentences).
+If unsure, direct to info@agronexustrading.in.
+Never make up prices or specs."""
 
 
 def ask(chain, question, chat_history=[]):
