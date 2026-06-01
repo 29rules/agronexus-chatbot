@@ -2,40 +2,38 @@ import os
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
-from rag import load_knowledge_base, create_chain, ask
+from rag import load_knowledge_base, build_knowledge_base, create_chain, ask
+import pathlib
 
 load_dotenv()
 
 app = Flask(__name__)
-CORS(app)  # Allow React frontend to call this API
+CORS(app)
 
-# Load knowledge base and create chain once at startup
 print("🚀 Starting Agronexus Chatbot API...")
-vector_store = load_knowledge_base()
-chain = create_chain(vector_store)
-print("✅ Ready!")
 
-# Store chat history per session (simple in-memory for now)
+# Build knowledge base if it doesn't exist (first deploy on Render)
+if not pathlib.Path("faiss_index").exists():
+    print("📚 No index found — building knowledge base...")
+    vector_store = build_knowledge_base()
+else:
+    print("📦 Loading existing knowledge base...")
+    vector_store = load_knowledge_base()
+
+chain = create_chain(vector_store)
 chat_sessions = {}
+print("✅ Ready!")
 
 
 @app.route("/health", methods=["GET"])
 def health():
-    """Health check endpoint"""
     return jsonify({"status": "ok", "bot": "AgroBot"})
 
 
 @app.route("/chat", methods=["POST"])
 def chat():
-    """
-    Main chat endpoint.
-    Expects: { "message": "...", "session_id": "..." }
-    Returns: { "answer": "...", "session_id": "..." }
-    """
     try:
         data = request.get_json()
-
-        # Validate input
         if not data or "message" not in data:
             return jsonify({"error": "message is required"}), 400
 
@@ -45,21 +43,14 @@ def chat():
         if not message:
             return jsonify({"error": "message cannot be empty"}), 400
 
-        # Get or create chat history for this session
         history = chat_sessions.get(session_id, [])
-
-        # Get answer from RAG chain
         answer = ask(chain, message, history)
 
-        # Update history (keep last 10 exchanges)
         history.append(("human", message))
         history.append(("ai", answer))
         chat_sessions[session_id] = history[-20:]
 
-        return jsonify({
-            "answer": answer,
-            "session_id": session_id
-        })
+        return jsonify({"answer": answer, "session_id": session_id})
 
     except Exception as e:
         print(f"Error: {e}")
@@ -67,5 +58,6 @@ def chat():
 
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 5000))
-    app.run(debug=True, port=port)
+    port = int(os.environ.get("PORT", 5000))
+    # 0.0.0.0 is critical for Render — allows external traffic
+    app.run(host="0.0.0.0", port=port, debug=False)
